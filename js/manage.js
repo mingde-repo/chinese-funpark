@@ -1,21 +1,27 @@
 "use strict";
 
-// ⚙ 管理 dialog: upload, replace, edit and delete game pages by committing to the GitHub repo.
-// Every change is ONE commit (the page file + js/uploaded-pages.js), so GitHub Pages rebuilds
-// once and the file and the list never get out of step. Talks to main.js only through the
-// "pages-changed" DOM event.
+// ⚙ 管理 dialog: upload, replace, edit and delete game pages in Supabase, through its REST APIs
+// (no SDK). The files go to the Storage bucket BUCKET under a new name for every version
+// (<key>_v<stamp>.html, <key>_v<stamp>.<ext>), and the list (with the current file names) to the
+// table TABLE. So no browser or CDN can ever serve an old version. A teacher signs in with an email and password (Supabase Auth); the
+// policies in Supabase let anyone read and only signed-in users write. Changes are live at once.
+// Talks to main.js only through the "pages-changed" DOM event.
 (() => {
-  const OWNER = "mingde-repo";
-  const REPO = "chinese-funpark";
-  const BRANCH = "main";
-  const API_BASE = `https://api.github.com/repos/${OWNER}/${REPO}`;
-  const SITE_URL = `https://${OWNER}.github.io/${REPO}/`;
-  const LIST_PATH = "js/uploaded-pages.js";
-  const LIST_HEADER =
-    '"use strict";\n' +
-    "// List of uploaded game pages. Written by the site's ⚙ 管理 dialog (js/manage.js); " +
-    "don't hand-edit the format.\n";
-  const UPLOAD_DIR = "pages/uploads";
+  // The Supabase project is set once, in the <meta> tags at the top of index.html.
+  function metaContent(name) {
+    const node = document.querySelector(`meta[name="${name}"]`);
+    return node ? node.content.trim() : "";
+  }
+  const SUPABASE_URL = metaContent("mingde-supabase-url").replace(/\/+$/, "");
+  const SUPABASE_KEY = metaContent("mingde-supabase-anon-key");
+  const CONFIGURED = Boolean(SUPABASE_URL && SUPABASE_KEY);
+  const BUCKET = "games";
+  const TABLE = "pages";
+  const FILE_BASE = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/`;
+  // Browsers (and the CDN) may keep a file this long. A file never changes under its name, so this
+  // only matters for a deleted game: devices that played it may keep their copy this long.
+  const CACHE_SECONDS = 30 * 24 * 60 * 60;
+  const HTML_TYPE = "text/html;charset=utf-8";
   const MAX_UPLOAD_MB = 50;
   const LARGE_UPLOAD_MB = 25;
   const KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -26,8 +32,13 @@
   const VOLUME_MAX = 20;
   const LESSON_MAX = 999;
   const CN_DIGITS = "零一二三四五六七八九";
-  // Optional thumbnail picture, saved as pages/uploads/<key>.<ext> in the same commit.
+  // A file name in the bucket: the key, "_v", the save time (14 digits, UTC) and the extension.
+  // Keys can't contain "_", so "<key>_" starts the names of that game's files only. The save
+  // time (not a counter) keeps names unique even when a deleted key is uploaded again.
+  const VERSIONED_NAME = /^([a-z0-9][a-z0-9-]{0,39})_v(\d{14})\.(html|png|jpg|webp)$/;
+  // Optional thumbnail picture, saved as <key>_v<stamp>.<ext> in the bucket.
   const THUMB_EXTS = ["png", "jpg", "webp"];
+  const THUMB_TYPES = { png: "image/png", jpg: "image/jpeg", webp: "image/webp" };
   const THUMB_MAX_MB = 1;
   // Thumbnails made from the pictures embedded in a game file: 4:3, at most this many choices.
   const THUMB_WIDTH = 640;
@@ -38,25 +49,35 @@
   const THUMB_SOURCE_MIN_PX = 160; // pictures narrower or shorter than this are skipped
   // A picture embedded as a data: URL. JSON and JS strings may write "\/" for "/".
   const DATA_IMAGE_RE = /data:image\\?\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/\\]+={0,2})/g;
-  const TOKEN_STORAGE_KEY = "mingde.githubToken";
-  const POLL_INTERVAL_MS = 10 * 1000;
-  const POLL_LIMIT_MS = 5 * 60 * 1000;
+  const SESSION_STORAGE_KEY = "mingde.supabaseSession";
+  // Where the GitHub token was remembered before. Removed on load, so it doesn't linger.
+  const OLD_TOKEN_STORAGE_KEY = "mingde.githubToken";
+  // Refresh the sign-in this many seconds before it expires.
+  const REFRESH_MARGIN_S = 60;
   const MB = 1024 * 1024;
-  const PUBLISHING_STATUS = "发布中… / Publishing…";
+  const NOT_CONFIGURED =
+    "网站还没有连接 Supabase（见 README）/ The site isn't connected to Supabase yet (see README).";
+  const FILES_NOT_DELETED =
+    "文件没有被删除（请检查 Supabase 存储的删除权限）/ The files were not deleted. Check the storage delete policy in Supabase.";
+  const ROW_NOT_SAVED =
+    "列表没有更新（请检查 Supabase 表 pages 的权限）/ The list was not updated. Check the policies of the pages table in Supabase.";
+  const PAGE_GONE = "这个页面已不存在 / This page no longer exists.";
 
   // Keep our own reference, taken before any game page loads, so a page in the iframe
-  // can't replace fetch and see the token.
+  // can't replace fetch and see the sign-in.
   const nativeFetch = window.fetch.bind(window);
 
   const byId = (id) => document.getElementById(id);
   const dialog = byId("manage-dialog");
   const manageBtn = byId("manage-btn");
   const closeBtn = byId("manage-close");
-  const tokenState = byId("token-state");
-  const tokenInput = byId("token-input");
-  const tokenUse = byId("token-use");
-  const tokenForget = byId("token-forget");
-  const tokenRemember = byId("token-remember");
+  const signinState = byId("signin-state");
+  const signinForm = byId("signin-form");
+  const signinEmail = byId("signin-email");
+  const signinPassword = byId("signin-password");
+  const signinOut = byId("signin-out");
+  const signinOutRow = byId("signin-out-row");
+  const signinRemember = byId("signin-remember");
   const uploadForm = byId("upload-form");
   const uploadFile = byId("upload-file");
   const uploadNote = byId("upload-note");
@@ -117,50 +138,56 @@
     }
   }
 
-  let token = loadSavedToken();
+  // The sign-in: { access_token, refresh_token, expires_at (seconds), email }, or null.
+  let session = loadSavedSession();
+  // Keep the sign-in in localStorage ("Remember on this device"), or only in memory.
+  let rememberSession = Boolean(session);
   let list = [];
-  let listFromApi = false;
   let busy = false;
   let editingKey = null;
-  const publishing = new Set();
-  let pollRun = 0;
 
   // ---------- small helpers ----------
 
-  function loadSavedToken() {
+  function loadSavedSession() {
     try {
-      return window.localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+      window.localStorage.removeItem(OLD_TOKEN_STORAGE_KEY);
+      const saved = JSON.parse(window.localStorage.getItem(SESSION_STORAGE_KEY) || "null");
+      return saved && typeof saved.refresh_token === "string" ? saved : null;
     } catch {
-      return "";
+      return null;
     }
   }
 
-  function saveToken(value) {
+  function saveSession(value) {
     try {
       if (value) {
-        window.localStorage.setItem(TOKEN_STORAGE_KEY, value);
+        window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(value));
       } else {
-        window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+        window.localStorage.removeItem(SESSION_STORAGE_KEY);
       }
     } catch {
       // Storage blocked (private window, file:// in some browsers): keep it in memory only.
     }
   }
 
-  function delay(ms) {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
-  }
-
   function nowIso() {
     return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   }
 
-  function pagePath(key) {
-    return `${UPLOAD_DIR}/${key}.html`;
+  // "20261116090000": the version part of new file names.
+  function versionStamp() {
+    return new Date().toISOString().replace(/\D/g, "").slice(0, 14);
   }
 
-  function thumbPath(key, ext) {
-    return `${UPLOAD_DIR}/${key}.${ext}`;
+  // A file name in the bucket for this game, version and extension.
+  function versionedName(key, stamp, ext) {
+    return `${key}_v${stamp}.${ext}`;
+  }
+
+  // `name` if it is a file name of this game with one of `exts`, else "".
+  function cleanFileName(name, key, exts) {
+    const match = typeof name === "string" ? VERSIONED_NAME.exec(name) : null;
+    return match && match[1] === key && exts.includes(match[3]) ? name : "";
   }
 
   // "png", "jpg" or "webp" from the file name ("" if it isn't one of those).
@@ -216,12 +243,14 @@
     updateUploadButton();
   }
 
-  // Upload is enabled only with a token and the required fields (file, key, title) filled.
+  // Upload is enabled only when signed in and the required fields (file, key, title) are filled.
   // The full checks still run on submit.
   function updateUploadButton() {
     let missing = "";
-    if (!token) {
-      missing = "请先在 ① 输入令牌 / Enter a GitHub token in section ① first.";
+    if (!CONFIGURED) {
+      missing = NOT_CONFIGURED;
+    } else if (!session) {
+      missing = "请先在 ① 登录 / Sign in in section ① first.";
     } else if (!uploadFile.files[0]) {
       missing = "请选择文件 / Choose a file.";
     } else if (!uploadKey.value.trim()) {
@@ -245,9 +274,13 @@
       if (typeof key !== "string" || !KEY_PATTERN.test(key)) return;
       if (RESERVED_KEYS.has(key) || seen.has(key)) return;
       if (typeof title !== "string" || !title.trim() || title.length > TITLE_MAX) return;
+      // The game's current HTML file. A row without one can't be opened, so it isn't listed.
+      const file = cleanFileName(entry.file, key, ["html"]);
+      if (!file) return;
       seen.add(key);
       result.push({
         key,
+        file,
         title: title.trim(),
         description:
           typeof entry.description === "string" ? entry.description.slice(0, DESC_MAX) : "",
@@ -260,144 +293,178 @@
         volume: cleanText(entry.volume, VOLUME_MAX),
         lesson: cleanLesson(entry.lesson),
         author: cleanText(entry.author, AUTHOR_MAX),
-        // The picture's file extension, or "" when the game has no picture.
-        thumb: THUMB_EXTS.includes(entry.thumb) ? entry.thumb : "",
+        // The picture's file name, or "" when the game has no picture.
+        thumb: cleanFileName(entry.thumb, key, THUMB_EXTS),
         updated: typeof entry.updated === "string" ? entry.updated : "",
       });
     });
     return result;
   }
 
-  function siteList() {
-    return cleanEntries(window.MINGDE_UPLOADED_PAGES);
-  }
-
-  function serializeList(entries) {
-    return `${LIST_HEADER}window.MINGDE_UPLOADED_PAGES = ${JSON.stringify(entries, null, 2)};\n`;
-  }
-
-  function parseList(text) {
-    const match = /window\.MINGDE_UPLOADED_PAGES\s*=\s*([\s\S]*?);\s*$/.exec(text);
-    if (!match) throw new Error(`${LIST_PATH} 格式不对 / ${LIST_PATH} has an unexpected format.`);
-    return cleanEntries(JSON.parse(match[1]));
-  }
-
-  function decodeBase64Utf8(b64) {
-    const binary = window.atob(b64.replace(/\s/g, ""));
-    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
-    return new TextDecoder().decode(bytes);
-  }
-
-  function readAsBase64(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.addEventListener("load", () => {
-        const dataUrl = String(reader.result);
-        resolve(dataUrl.slice(dataUrl.indexOf(",") + 1));
-      });
-      reader.addEventListener("error", () => {
-        reject(reader.error || new Error("无法读取文件 / Could not read the file."));
-      });
-      reader.readAsDataURL(file);
-    });
-  }
-
   // Tell main.js to redraw the contents page.
   function notifyPages(status) {
-    const detail = { pages: list.map((page) => ({ ...page })), publishing: [...publishing] };
+    const detail = { pages: list.map((page) => ({ ...page })) };
     if (status !== undefined) detail.status = status;
     document.dispatchEvent(new CustomEvent("pages-changed", { detail }));
   }
 
-  // ---------- GitHub REST API ----------
+  // ---------- Supabase REST API ----------
 
-  async function api(path, method = "GET", body) {
-    const headers = {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
+  // Supabase puts the message in one of several fields. Storage can answer HTTP 400 with the
+  // real status in "statusCode" (e.g. "403" for a policy, "413" for a file that is too big).
+  async function apiError(res) {
+    let status = res.status;
+    let message = res.statusText;
+    try {
+      const body = await res.json();
+      message = body.msg || body.message || body.error_description || body.error || message;
+      const inner = Number(body.statusCode);
+      if (status === 400 && inner >= 400 && inner < 600) status = inner;
+    } catch {
+      // Not JSON: keep the status text.
+    }
+    return new ApiError(status, String(message));
+  }
+
+  async function readJson(res) {
+    if (!res.ok) throw await apiError(res);
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }
+
+  // Supabase Auth: grant "password" ({ email, password }) or "refresh_token" ({ refresh_token }).
+  async function authRequest(grant, body) {
+    const res = await nativeFetch(`${SUPABASE_URL}/auth/v1/token?grant_type=${grant}`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+    return readJson(res);
+  }
+
+  function keepSession(data) {
+    const user = data.user || {};
+    session = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: data.expires_at || Math.floor(Date.now() / 1000) + (data.expires_in || 3600),
+      email: user.email || (session ? session.email : ""),
     };
-    const init = { method, headers, cache: "no-store" };
-    if (body !== undefined) {
-      headers["Content-Type"] = "application/json";
-      init.body = JSON.stringify(body);
-    }
-    const res = await nativeFetch(`${API_BASE}/${path}`, init);
-    if (!res.ok) {
-      let message = res.statusText;
-      try {
-        message = (await res.json()).message || message;
-      } catch {
-        // Not JSON: keep the status text.
-      }
-      throw new ApiError(res.status, message);
-    }
-    return res.json();
+    saveSession(rememberSession ? session : null);
   }
 
-  async function readListAt(ref) {
+  function dropSession() {
+    session = null;
+    saveSession(null);
+    renderSignInState();
+    updateUploadButton();
+  }
+
+  // The access token, refreshed first when it is about to expire. "" when signed out.
+  async function accessToken() {
+    if (!session) return "";
+    if (session.expires_at - REFRESH_MARGIN_S > Date.now() / 1000) return session.access_token;
     try {
-      const file = await api(`contents/${LIST_PATH}?ref=${encodeURIComponent(ref)}`);
-      return parseList(decodeBase64Utf8(file.content || ""));
+      keepSession(await authRequest("refresh_token", { refresh_token: session.refresh_token }));
     } catch (err) {
-      if (err instanceof ApiError && err.status === 404) return [];
+      // The refresh token was revoked or has expired: the teacher has to sign in again.
+      if (err instanceof ApiError && err.status < 500) {
+        dropSession();
+        throw new ApiError(401, err.message);
+      }
       throw err;
     }
+    return session.access_token;
   }
 
-  async function uploadedFileNames(ref) {
-    try {
-      const entries = await api(`contents/${UPLOAD_DIR}?ref=${encodeURIComponent(ref)}`);
-      return new Set(Array.isArray(entries) ? entries.map((entry) => entry.name) : []);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 404) return new Set();
-      throw err;
+  // One REST call. `json` is sent as JSON, `body` as it is (a File). Signed out, the call has
+  // only the anon key, which the policies allow to read but not to write.
+  async function call(path, { method = "GET", headers = {}, json, body } = {}) {
+    const init = { method, headers: { apikey: SUPABASE_KEY, ...headers }, cache: "no-store" };
+    const bearer = await accessToken();
+    if (bearer) init.headers.Authorization = `Bearer ${bearer}`;
+    if (json !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(json);
+    } else if (body !== undefined) {
+      init.body = body;
     }
+    return readJson(await nativeFetch(`${SUPABASE_URL}${path}`, init));
   }
 
-  // One commit on top of the newest main. `update(before, parentSha)` gets the list as it is
-  // in the repo and returns { list, message, files } (extra tree entries).
-  async function commitChange(update) {
-    for (let attempt = 1; ; attempt += 1) {
-      const ref = await api(`git/ref/heads/${BRANCH}`);
-      const parentSha = ref.object.sha;
-      const parent = await api(`git/commits/${parentSha}`);
-      const before = await readListAt(parentSha);
-      const { list: next, message, files } = await update(before, parentSha);
-      const listText = serializeList(next);
-      const tree = await api("git/trees", "POST", {
-        base_tree: parent.tree.sha,
-        tree: [{ path: LIST_PATH, mode: "100644", type: "blob", content: listText }, ...files],
-      });
-      const commit = await api("git/commits", "POST", {
-        message,
-        tree: tree.sha,
-        parents: [parentSha],
-      });
-      try {
-        await api(`git/refs/heads/${BRANCH}`, "PATCH", { sha: commit.sha });
-        return { list: next, listText };
-      } catch (err) {
-        // 422: main moved on while we worked (another commit landed). Start again once.
-        if (attempt < 2 && err instanceof ApiError && err.status === 422) continue;
-        throw err;
-      }
-    }
+  function rowFilter(key) {
+    return `key=eq.${encodeURIComponent(key)}`;
+  }
+
+  async function fetchList() {
+    return cleanEntries(await call(`/rest/v1/${TABLE}?select=*&order=key`));
+  }
+
+  // One entry, or null when there is none.
+  async function fetchRow(key) {
+    const rows = cleanEntries(await call(`/rest/v1/${TABLE}?select=*&${rowFilter(key)}`));
+    return rows[0] || null;
+  }
+
+  // Upload one new file to the bucket. Names are never reused, so an existing file is never
+  // overwritten: if two teachers save the same game in the same second, the second one gets a
+  // 409 ("please try again") instead of silently replacing the first one's file.
+  async function putFile(name, file, type) {
+    return call(`/storage/v1/object/${BUCKET}/${encodeURIComponent(name)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": type,
+        "x-upsert": "false",
+        "cache-control": `max-age=${CACHE_SECONDS}`,
+      },
+      body: file,
+    });
+  }
+
+  // All of this game's files in the bucket, every version ("<key>_…").
+  async function filesOf(key) {
+    const prefix = `${key}_`;
+    const found = await call(`/storage/v1/object/list/${BUCKET}`, {
+      method: "POST",
+      json: { prefix: "", search: prefix, limit: 1000 },
+    });
+    return (Array.isArray(found) ? found : [])
+      .map((obj) => obj.name)
+      .filter((name) => typeof name === "string" && name.startsWith(prefix));
+  }
+
+  // Delete files from the bucket, and make sure they are gone. When a storage policy blocks the
+  // delete, Supabase still answers 200 and just lists nothing. So the names missing from the
+  // answer are looked up: files that were already gone (a retry) are fine, files still there fail.
+  async function removeFiles(key, names) {
+    if (names.length === 0) return;
+    const removed = await call(`/storage/v1/object/${BUCKET}`, {
+      method: "DELETE",
+      json: { prefixes: names },
+    });
+    const gone = new Set((Array.isArray(removed) ? removed : []).map((obj) => obj.name));
+    const unsure = names.filter((name) => !gone.has(name));
+    if (unsure.length === 0) return;
+    const present = new Set(await filesOf(key));
+    if (unsure.some((name) => present.has(name))) throw new Error(FILES_NOT_DELETED);
   }
 
   function describeError(err) {
     if (err instanceof ApiError) {
       switch (err.status) {
         case 401:
-          return "令牌无效或已过期 / The token is invalid or has expired.";
+          return `请重新登录 / Signed out, or the sign-in has expired. Sign in again. (${err.message})`;
         case 403:
-          return `没有权限，令牌需要 Contents: Read and write / Not allowed: the token needs Contents read and write. (${err.message})`;
+          return `没有权限，请检查 Supabase 的权限设置 / Not allowed: check the policies in Supabase. (${err.message})`;
         case 404:
-          return "找不到仓库，或令牌无权访问它 / Repository not found, or the token has no access to it.";
+          return `找不到，请检查 Supabase 的表和存储桶 / Not found: check the table and the bucket in Supabase. (${err.message})`;
         case 409:
-        case 422:
-          return `GitHub 拒绝了这次修改，请重试 / GitHub rejected the change, please try again. (${err.message})`;
+          return `Supabase 拒绝了这次修改，请重试 / Supabase rejected the change, please try again. (${err.message})`;
+        case 413:
+          return `文件太大，超过 Supabase 的上限 / The file is larger than Supabase allows. (${err.message})`;
         default:
-          return `GitHub ${err.status}: ${err.message}`;
+          return `Supabase ${err.status}: ${err.message}`;
       }
     }
     if (err instanceof TypeError) {
@@ -406,151 +473,137 @@
     return err && err.message ? err.message : String(err);
   }
 
-  // ---------- publishing ----------
-
-  // Wait until GitHub Pages serves the list we just committed. The page file is in the same
-  // commit, so once the list is live the page is live too.
-  async function watchPublish(listText) {
-    const run = ++pollRun;
-    const expected = listText.trim();
-    const started = Date.now();
-    while (Date.now() - started < POLL_LIMIT_MS) {
-      await delay(POLL_INTERVAL_MS);
-      if (run !== pollRun) return; // a newer change is being watched instead
-      try {
-        const res = await nativeFetch(`${SITE_URL}${LIST_PATH}?t=${Date.now()}`, {
-          cache: "no-store",
-        });
-        if (res.ok && (await res.text()).trim() === expected) {
-          if (run !== pollRun) return;
-          publishing.clear();
-          setStatus("✓ 已上线 / Live on the site.", "ok");
-          notifyPages("✓ 已上线 / Live");
-          return;
-        }
-      } catch {
-        // Offline or blocked: try again next round.
-      }
-    }
-    if (run !== pollRun) return;
-    publishing.clear();
-    setStatus(
-      "发布时间比平常长，请几分钟后刷新网站 / Publishing is taking longer than usual. Reload the site in a few minutes.",
-    );
-    notifyPages("发布较慢，请稍后刷新 / Still publishing, reload later");
-  }
-
-  function afterCommit(result, key, waitForFile) {
-    list = result.list;
-    listFromApi = true;
-    renderList();
-    if (waitForFile) publishing.add(key);
-    notifyPages(PUBLISHING_STATUS);
-    watchPublish(result.listText);
-  }
-
   // ---------- operations ----------
+  // Each one uploads new files first, then switches the list row to them, then deletes the files
+  // the row no longer points at, and reads the list again. They return { list, warning }: warning
+  // is "" or a note about an old file left behind.
 
-  // Send the chosen picture to GitHub as a blob: { ext, sha }, or null when none was chosen.
-  async function uploadThumbBlob(file) {
-    if (!file) return null;
+  // Upload the chosen picture under a new name. Returns that name, or "" when none was chosen.
+  async function putThumb(key, file, stamp) {
+    if (!file) return "";
+    const ext = thumbExt(file);
+    const name = versionedName(key, stamp, ext);
     setStatus("正在上传图片… / Uploading the picture…");
-    const content = await readAsBase64(file);
-    const blob = await api("git/blobs", "POST", { content, encoding: "base64" });
-    return { ext: thumbExt(file), sha: blob.sha };
+    await putFile(name, file, THUMB_TYPES[ext]);
+    return name;
   }
 
-  // The picture part of a commit. `newThumb` (from uploadThumbBlob) replaces the picture,
-  // `remove` drops it, neither keeps `oldThumb`. The old file is deleted when its name changes
-  // (another extension) or the picture is removed. Returns { thumb, files }.
-  async function thumbChanges(key, oldThumb, newThumb, remove, parentSha) {
-    const files = [];
-    let thumb = oldThumb;
-    if (newThumb) {
-      thumb = newThumb.ext;
-      files.push({ path: thumbPath(key, thumb), mode: "100644", type: "blob", sha: newThumb.sha });
-    } else if (remove) {
-      thumb = "";
-    }
-    if (oldThumb && oldThumb !== thumb) {
-      // Deleting a path that isn't in the tree makes GitHub reject the whole commit.
-      const names = await uploadedFileNames(parentSha);
-      if (names.has(`${key}.${oldThumb}`)) {
-        files.push({ path: thumbPath(key, oldThumb), mode: "100644", type: "blob", sha: null });
+  // Save the row. If that fails, the files just uploaded for it are removed again (best effort;
+  // Delete would remove any that stay, since it deletes every "<key>_…" file).
+  async function saveRow(key, newFiles, save) {
+    try {
+      return await save();
+    } catch (err) {
+      try {
+        await removeFiles(key, newFiles.filter(Boolean));
+      } catch {
+        // Left for a later Delete.
       }
+      throw err;
     }
-    return { thumb, files };
+  }
+
+  // Delete the files the row no longer points at (the old game version, an old picture).
+  // The save itself already worked, so a failure is only a warning.
+  async function dropOldFiles(key, before, after) {
+    const old = before ? [before.file, before.thumb] : [];
+    const names = old.filter((name) => name && name !== after.file && name !== after.thumb);
+    try {
+      await removeFiles(key, names);
+      return "";
+    } catch (err) {
+      return `旧文件没有删除 / An old file was not deleted: ${describeError(err)}`;
+    }
   }
 
   // `fields` comes from pageFields(): key, title, description, textbook, volume, lesson, author.
   // `thumbFile` is the chosen picture, or undefined to keep the current one (if any).
   async function uploadPage(file, fields, thumbFile) {
     const { key } = fields;
-    setStatus("正在读取文件… / Reading the file…");
-    const content = await readAsBase64(file);
+    const before = await fetchRow(key);
+    const stamp = versionStamp();
+    const htmlName = versionedName(key, stamp, "html");
     setStatus(
       `正在上传 ${(file.size / MB).toFixed(1)} MB… / Uploading ${(file.size / MB).toFixed(1)} MB…`,
     );
-    const blob = await api("git/blobs", "POST", { content, encoding: "base64" });
-    const newThumb = await uploadThumbBlob(thumbFile);
-    setStatus("正在提交… / Committing…");
-    return commitChange(async (before, parentSha) => {
-      const next = before.slice();
-      const index = next.findIndex((page) => page.key === key);
-      const oldThumb = index >= 0 ? next[index].thumb : "";
-      const picture = await thumbChanges(key, oldThumb, newThumb, false, parentSha);
-      const entry = { ...fields, thumb: picture.thumb, updated: nowIso() };
-      if (index >= 0) {
-        next[index] = entry;
-      } else {
-        next.push(entry);
-      }
-      return {
-        list: next,
-        message: `${index >= 0 ? "Replace" : "Upload"} page ${key}`,
-        files: [
-          { path: pagePath(key), mode: "100644", type: "blob", sha: blob.sha },
-          ...picture.files,
-        ],
-      };
+    await putFile(htmlName, file, HTML_TYPE);
+    const newThumb = await saveRow(key, [htmlName], () => putThumb(key, thumbFile, stamp));
+    const after = { file: htmlName, thumb: newThumb || (before ? before.thumb : "") };
+    setStatus("正在保存列表… / Saving the list…");
+    await saveRow(key, [htmlName, newThumb], async () => {
+      const rows = await call(`/rest/v1/${TABLE}?on_conflict=key`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        json: { ...fields, ...after, updated: nowIso() },
+      });
+      if (!Array.isArray(rows) || rows.length === 0) throw new Error(ROW_NOT_SAVED);
     });
+    const warning = await dropOldFiles(key, before, after);
+    return { list: await fetchList(), warning };
   }
 
   // `thumbFile`: a new picture (or undefined). `removeThumb`: drop the picture.
+  // The game file keeps its name, so devices don't download the game again.
   async function editPage(fields, thumbFile, removeThumb) {
     const { key } = fields;
-    const newThumb = await uploadThumbBlob(thumbFile);
-    setStatus("正在提交… / Committing…");
-    return commitChange(async (before, parentSha) => {
-      const next = before.slice();
-      const index = next.findIndex((page) => page.key === key);
-      if (index < 0) throw new Error("这个页面已不存在 / This page no longer exists.");
-      const picture = await thumbChanges(key, next[index].thumb, newThumb, removeThumb, parentSha);
-      next[index] = { ...next[index], ...fields, thumb: picture.thumb, updated: nowIso() };
-      return { list: next, message: `Edit page ${key}`, files: picture.files };
+    const before = await fetchRow(key);
+    if (!before) throw new Error(PAGE_GONE);
+    const newThumb = await putThumb(key, thumbFile, versionStamp());
+    const after = { file: before.file, thumb: newThumb || (removeThumb ? "" : before.thumb) };
+    setStatus("正在保存… / Saving…");
+    await saveRow(key, [newThumb], async () => {
+      const rows = await call(`/rest/v1/${TABLE}?${rowFilter(key)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        json: { ...fields, thumb: after.thumb, updated: nowIso() },
+      });
+      // When a policy blocks the update, nothing changes and the answer is still 200.
+      if (!Array.isArray(rows) || rows.length === 0) {
+        throw new Error((await fetchRow(key)) ? ROW_NOT_SAVED : PAGE_GONE);
+      }
     });
+    const warning = await dropOldFiles(key, before, after);
+    return { list: await fetchList(), warning };
   }
 
-  // Removes the page file and its picture (whatever its extension).
+  // Files first, row last: if a step fails, the game is still listed and pressing Delete again
+  // finishes the job, so no file is left without a list entry. Every file of the game is deleted
+  // (all versions), so anything an earlier failed cleanup left behind goes too.
   async function deletePage(key) {
-    setStatus("正在删除… / Deleting…");
-    return commitChange(async (before, parentSha) => {
-      const names = await uploadedFileNames(parentSha);
-      const files = ["html", ...THUMB_EXTS]
-        .filter((ext) => names.has(`${key}.${ext}`))
-        .map((ext) => ({ path: `${UPLOAD_DIR}/${key}.${ext}`, mode: "100644", type: "blob", sha: null }));
-      return {
-        list: before.filter((page) => page.key !== key),
-        message: `Delete page ${key}`,
-        files,
-      };
+    setStatus("正在删除文件… / Deleting the files…");
+    await removeFiles(key, await filesOf(key));
+    setStatus("正在更新列表… / Updating the list…");
+    const rows = await call(`/rest/v1/${TABLE}?${rowFilter(key)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=representation" },
     });
+    // An empty answer is fine only when the row is really gone (it may have been deleted already).
+    if ((!Array.isArray(rows) || rows.length === 0) && (await fetchRow(key))) {
+      throw new Error(ROW_NOT_SAVED);
+    }
+    return { list: await fetchList(), warning: "" };
   }
 
-  function needToken() {
-    if (token) return true;
-    setStatus("请先在 ① 输入令牌 / Enter a GitHub token in section ① first.", "error");
-    tokenInput.focus();
+  // Show the new list everywhere, and the outcome (plus any warning) in the dialog.
+  function afterSave(result, message) {
+    list = result.list;
+    renderList();
+    notifyPages();
+    if (result.warning) {
+      setStatus(`${message} ${result.warning}`, "error");
+    } else {
+      setStatus(message, "ok");
+    }
+  }
+
+  function needSignIn() {
+    if (!CONFIGURED) {
+      setStatus(NOT_CONFIGURED, "error");
+      return false;
+    }
+    if (session) return true;
+    setStatus("请先在 ① 登录 / Sign in in section ① first.", "error");
+    signinEmail.focus();
     return false;
   }
 
@@ -566,17 +619,18 @@
     }
   }
 
+  // Read the newest list (signed in or not: anyone may read it).
+  async function loadList() {
+    setStatus("正在读取列表… / Loading the list…");
+    list = await fetchList();
+    renderList();
+    notifyPages();
+    setStatus("");
+  }
+
   async function refreshList() {
-    if (!token || busy) return;
-    await runTask(async () => {
-      setStatus("正在从 GitHub 读取列表… / Loading the list from GitHub…");
-      const ref = await api(`git/ref/heads/${BRANCH}`);
-      list = await readListAt(ref.object.sha);
-      listFromApi = true;
-      renderList();
-      notifyPages();
-      setStatus("✓ 令牌可用，列表已更新 / Token works. List loaded from GitHub.", "ok");
-    });
+    if (!CONFIGURED || busy) return;
+    await runTask(loadList);
   }
 
   // ---------- thumbnails made from the game ----------
@@ -753,12 +807,14 @@
     }
   }
 
-  // The uploaded game as it is on the live site (it may still be publishing).
+  // The uploaded game as it is in the bucket.
   async function fetchLiveGame(key) {
-    const res = await nativeFetch(`${SITE_URL}${pagePath(key)}?t=${Date.now()}`, { cache: "no-store" });
+    const page = list.find((entry) => entry.key === key);
+    if (!page) throw new Error(PAGE_GONE);
+    const res = await nativeFetch(`${FILE_BASE}${page.file}`, { cache: "no-store" });
     if (!res.ok) {
       throw new Error(
-        `无法读取网站上的游戏（HTTP ${res.status}），如刚上传请等它上线 / Couldn't load the game from the site (HTTP ${res.status}). If it was just uploaded, wait until it is live.`,
+        `无法读取存储里的游戏（HTTP ${res.status}）/ Couldn't load the game from storage (HTTP ${res.status}).`,
       );
     }
     return res.text();
@@ -872,13 +928,19 @@
 
   // ---------- rendering ----------
 
-  function renderTokenState() {
-    if (!token) {
-      tokenState.textContent = "未设置令牌：只能查看 / No token: view only.";
-    } else if (loadSavedToken()) {
-      tokenState.textContent = "令牌已设置，保存在此设备 / Token set and saved on this device.";
+  // Signed out: the email/password row. Signed in: who, and the Sign out button.
+  function renderSignInState() {
+    signinForm.hidden = Boolean(session) || !CONFIGURED;
+    signinOutRow.hidden = !session;
+    signinRemember.checked = rememberSession;
+    if (!CONFIGURED) {
+      signinState.textContent = NOT_CONFIGURED;
+    } else if (!session) {
+      signinState.textContent = "未登录：只能查看 / Not signed in: view only.";
+    } else if (rememberSession) {
+      signinState.textContent = `已登录：${session.email}，保存在此设备 / Signed in as ${session.email}, remembered on this device.`;
     } else {
-      tokenState.textContent = "令牌已设置，仅本次打开有效 / Token set for this visit only.";
+      signinState.textContent = `已登录：${session.email}，仅本次打开有效 / Signed in as ${session.email} for this visit only.`;
     }
   }
 
@@ -927,11 +989,10 @@
     });
     pageList.replaceChildren(...rows);
 
-    if (list.length === 0) {
+    if (!CONFIGURED) {
+      listNote.textContent = NOT_CONFIGURED;
+    } else if (list.length === 0) {
       listNote.textContent = "还没有上传的页面 / No uploaded pages yet.";
-    } else if (!listFromApi) {
-      listNote.textContent =
-        "这是网站上的列表；输入令牌后显示 GitHub 上最新的列表 / This is the list on the site. Enter a token to see the newest list from GitHub.";
     } else {
       listNote.textContent = "";
     }
@@ -958,55 +1019,60 @@
 
   // ---------- events ----------
 
+  // Opening the dialog always reads the newest list.
   manageBtn.addEventListener("click", () => {
-    if (!listFromApi) list = siteList();
-    tokenRemember.checked = Boolean(loadSavedToken());
-    renderTokenState();
+    renderSignInState();
     renderList();
     updateUploadButton();
     if (!dialog.open) dialog.showModal();
-    if (token && !listFromApi) refreshList();
+    refreshList();
   });
 
   closeBtn.addEventListener("click", () => dialog.close());
 
-  tokenUse.addEventListener("click", () => {
-    const value = tokenInput.value.trim();
-    tokenInput.value = "";
-    if (!value) {
-      setStatus("请先粘贴令牌 / Paste a token first.", "error");
-      tokenInput.focus();
-      return;
-    }
-    token = value;
-    saveToken(tokenRemember.checked ? value : "");
-    renderTokenState();
-    updateUploadButton();
-    refreshList();
+  signinForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (busy || !CONFIGURED) return;
+    const email = signinEmail.value.trim();
+    const password = signinPassword.value;
+    if (!email) return fail(signinEmail, "请填写邮箱 / Enter your email.");
+    if (!password) return fail(signinPassword, "请填写密码 / Enter your password.");
+    runTask(async () => {
+      setStatus("正在登录… / Signing in…");
+      try {
+        rememberSession = signinRemember.checked;
+        keepSession(await authRequest("password", { email, password }));
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 400) {
+          throw new Error("邮箱或密码不对 / Wrong email or password.");
+        }
+        throw err;
+      }
+      signinPassword.value = "";
+      renderSignInState();
+      await loadList();
+      setStatus(`✓ 已登录 / Signed in as ${session.email}.`, "ok");
+    });
   });
 
-  tokenInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      tokenUse.click();
-    }
+  // Signing out ends the session in Supabase too (best effort) and forgets it here.
+  signinOut.addEventListener("click", () => {
+    if (busy || !session) return;
+    const bearer = session.access_token;
+    nativeFetch(`${SUPABASE_URL}/auth/v1/logout`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${bearer}` },
+    }).catch(() => {
+      // Offline: the session still ends here, and its tokens expire on their own.
+    });
+    dropSession();
+    setStatus("已退出 / Signed out.");
   });
 
-  tokenForget.addEventListener("click", () => {
-    token = "";
-    saveToken("");
-    tokenRemember.checked = false;
-    listFromApi = false;
-    list = siteList();
-    renderTokenState();
-    renderList();
-    updateUploadButton();
-    setStatus("令牌已清除 / Token forgotten.");
-  });
-
-  tokenRemember.addEventListener("change", () => {
-    if (token) saveToken(tokenRemember.checked ? token : "");
-    renderTokenState();
+  signinRemember.addEventListener("change", () => {
+    rememberSession = signinRemember.checked;
+    saveSession(rememberSession ? session : null);
+    renderSignInState();
   });
 
   uploadFile.addEventListener("change", () => {
@@ -1087,7 +1153,7 @@
 
   uploadForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (busy || !needToken() || !checkUploadForm()) return;
+    if (busy || !needSignIn() || !checkUploadForm()) return;
     const file = uploadFile.files[0];
     // A picture file chosen by hand wins over a thumbnail made from the game.
     const thumbFile = uploadThumb.files[0] || pickerFile(uploadPicker);
@@ -1103,11 +1169,7 @@
       const result = await uploadPage(file, fields, thumbFile);
       uploadForm.reset();
       if (editingKey === key) stopEdit();
-      afterCommit(result, key, true);
-      setStatus(
-        `✓ 已提交 “${fields.title}”，正在发布（约 1–2 分钟）/ Committed. Publishing takes about 1–2 minutes.`,
-        "ok",
-      );
+      afterSave(result, `✓ 已上传 “${fields.title}”，已上线 / Uploaded. It is live now.`);
     });
   });
 
@@ -1128,15 +1190,14 @@
       uploadForm.scrollIntoView({ block: "nearest" });
       uploadFile.focus();
     } else if (btn.dataset.action === "delete") {
-      if (!needToken()) return;
+      if (!needSignIn()) return;
       if (!window.confirm(`删除 “${page.title}”（${page.key}）？\nDelete "${page.title}" (${page.key})?`)) {
         return;
       }
       runTask(async () => {
         const result = await deletePage(page.key);
         if (editingKey === page.key) stopEdit();
-        afterCommit(result, page.key, false);
-        setStatus("✓ 已删除，正在发布（约 1–2 分钟）/ Deleted. Publishing takes about 1–2 minutes.", "ok");
+        afterSave(result, "✓ 已删除（游戏文件和图片都已删除）/ Deleted, with its file and picture.");
       });
     }
   });
@@ -1144,7 +1205,7 @@
   editForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const key = editingKey;
-    if (busy || !key || !needToken() || !checkPageFields(editFields) || !checkThumb(editThumb)) return;
+    if (busy || !key || !needSignIn() || !checkPageFields(editFields) || !checkThumb(editThumb)) return;
     const fields = pageFields(key, editFields);
     // A picture file chosen by hand wins, then "Remove the picture", then a thumbnail from the game.
     const removeThumb = editThumbRemove.checked;
@@ -1152,8 +1213,7 @@
     runTask(async () => {
       const result = await editPage(fields, thumbFile, removeThumb);
       stopEdit();
-      afterCommit(result, key, false);
-      setStatus("✓ 已保存，正在发布（约 1–2 分钟）/ Saved. Publishing takes about 1–2 minutes.", "ok");
+      afterSave(result, "✓ 已保存，已上线 / Saved. It is live now.");
     });
   });
 

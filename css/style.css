@@ -363,15 +363,6 @@ a.card:hover .card-title {
   overflow-wrap: anywhere;
 }
 
-/* Still publishing: not a link yet. */
-.card-pending {
-  color: var(--muted);
-}
-
-.card-pending .card-thumb {
-  opacity: 0.6;
-}
-
 .contents-empty {
   margin: 0;
   padding: 16px 0;

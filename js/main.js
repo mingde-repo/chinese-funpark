@@ -3,10 +3,26 @@
 // Main page: shows one game at a time in the iframe, driven by the URL hash.
 // The nav holds the built-in games and a "…" button that opens #contents: a grid of thumbnail
 // cards for the uploaded games, under a filter bar (field → value, or a keyword) whose filters add up.
-// Uploaded games come from
-// js/uploaded-pages.js (window.MINGDE_UPLOADED_PAGES) and from "pages-changed" events sent
-// by js/manage.js.
+// Uploaded games live in Supabase: the list in the table `pages`, the files in the Storage bucket
+// `games`. The list is read once at start-up and again from "pages-changed" events sent by
+// js/manage.js.
 (() => {
+  // Keep our own reference, taken before any game page loads (games run on this origin).
+  const nativeFetch = window.fetch.bind(window);
+
+  // The Supabase project is set once, in the <meta> tags at the top of index.html.
+  function metaContent(name) {
+    const node = document.querySelector(`meta[name="${name}"]`);
+    return node ? node.content.trim() : "";
+  }
+  const SUPABASE_URL = metaContent("mingde-supabase-url").replace(/\/+$/, "");
+  const SUPABASE_KEY = metaContent("mingde-supabase-anon-key");
+  const CONFIGURED = Boolean(SUPABASE_URL && SUPABASE_KEY);
+  const LIST_URL = `${SUPABASE_URL}/rest/v1/pages?select=*&order=key`;
+  const FILE_BASE = `${SUPABASE_URL}/storage/v1/object/public/games/`;
+  // Storage serves .html as text/plain, so a game is shown from a blob: URL of this type.
+  const GAME_TYPE = "text/html;charset=utf-8";
+
   const BUILTIN_PAGES = {
     adventure: {
       src: "pages/adventure-world.html",
@@ -23,8 +39,6 @@
   const CONTENTS_KEY = "contents";
   const CONTENTS_META = { title: "目录", description: "" };
   const SITE_TITLE = "明德中文乐园";
-  const UPLOAD_DIR = "pages/uploads/";
-  const LIST_SCRIPT = "js/uploaded-pages.js";
   const KEY_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
   const TITLE_MAX = 40;
   const DESC_MAX = 200;
@@ -33,12 +47,21 @@
   const VOLUME_MAX = 20;
   const LESSON_MAX = 999;
   const CN_DIGITS = "零一二三四五六七八九";
-  // Thumbnail pictures are pages/uploads/<key>.<thumb>. Without one, a card shows a colored
-  // tile (one of TILE_COUNT colors in css/style.css, picked from the key).
+  // Every version of a game file has its own name in the bucket, <key>_v<14 digits>.<ext>, and
+  // the list row holds the current names (`file`, and `thumb` for the picture). So a link never
+  // points at an old version, and no cache can serve one. Without a picture, a card shows a
+  // colored tile (one of TILE_COUNT colors in css/style.css, picked from the key).
+  const VERSIONED_NAME = /^([a-z0-9][a-z0-9-]{0,39})_v(\d{14})\.(html|png|jpg|webp)$/;
   const THUMB_EXTS = ["png", "jpg", "webp"];
   const TILE_COUNT = 6;
-  const PUBLISHING_LABEL = "（发布中…）";
-  const PUBLISHING_STATUS = "发布中… / Publishing…";
+  const LOADING_STATUS = "加载中… / Loading…";
+  // What the contents page says while it has no games, by the state of the list.
+  const EMPTY_TEXT = {
+    loading: "正在读取游戏列表… / Loading the game list…",
+    error: "无法读取游戏列表，请检查网络后刷新 / Couldn't load the game list. Check the connection and reload.",
+    unconfigured: "网站还没有连接 Supabase（见 README）/ The site isn't connected to Supabase yet (see README).",
+    ok: "还没有上传的游戏 / No uploaded games yet.",
+  };
   // Filter bar: pick a field, then one of its values ("all", or "=<value>" for matching rows
   // only). Each field keeps its own value, and a row must match them all. The extra field
   // KEYWORD_FIELD ("关键词 / Text") shows a text box instead: text that the title, description,
@@ -71,11 +94,13 @@
 
   let pages = { ...BUILTIN_PAGES };
   let uploaded = [];
-  let publishing = new Set();
+  let listState = CONFIGURED ? "loading" : "unconfigured";
   let currentKey = null;
   let gotManagerList = false;
-  // A hash asked for at start-up that the (possibly cached) list didn't know yet.
-  let pendingKey = null;
+  // Each showPage() counts up, so a game that finishes loading after the user moved on is dropped.
+  let loadRun = 0;
+  // The blob: URL of the uploaded game on show ("" for none), revoked when the page changes.
+  let gameUrl = "";
 
   function hasOwn(obj, key) {
     return Object.prototype.hasOwnProperty.call(obj, key);
@@ -105,6 +130,12 @@
     return lesson === null ? "" : `第${chineseNumber(lesson)}课`;
   }
 
+  // `name` if it is a file name of this game with one of `exts`, else "".
+  function cleanFileName(name, key, exts) {
+    const match = typeof name === "string" ? VERSIONED_NAME.exec(name) : null;
+    return match && match[1] === key && exts.includes(match[3]) ? name : "";
+  }
+
   // Keep only well-formed entries; the list is written by the site but is still input.
   function cleanList(raw) {
     const result = [];
@@ -116,9 +147,13 @@
       if (typeof key !== "string" || !KEY_PATTERN.test(key)) return;
       if (hasOwn(BUILTIN_PAGES, key) || key === CONTENTS_KEY || seen.has(key)) return;
       if (typeof title !== "string" || !title.trim() || title.length > TITLE_MAX) return;
+      // A row without a game file can't be opened, so it isn't listed.
+      const file = cleanFileName(entry.file, key, ["html"]);
+      if (!file) return;
       seen.add(key);
       result.push({
         key,
+        file,
         title: title.trim(),
         description: cleanText(entry.description, DESC_MAX),
         // Older entries have a single "book" text instead; show it as the textbook.
@@ -126,7 +161,7 @@
         volume: cleanText(entry.volume, VOLUME_MAX),
         lesson: cleanLesson(entry.lesson),
         author: cleanText(entry.author, AUTHOR_MAX),
-        thumb: THUMB_EXTS.includes(entry.thumb) ? entry.thumb : "",
+        thumb: cleanFileName(entry.thumb, key, THUMB_EXTS),
         updated: typeof entry.updated === "string" ? entry.updated : "",
       });
     });
@@ -166,27 +201,71 @@
     document.title = `${page.title} · ${SITE_TITLE}`;
   }
 
+  function revokeGameUrl() {
+    if (gameUrl) URL.revokeObjectURL(gameUrl);
+    gameUrl = "";
+  }
+
+  // An uploaded game: Storage serves it as text/plain, so load it and show it from a blob: URL.
+  // Over http(s) a blob: page has this page's origin, so the game's localStorage and the
+  // postMessage check work as they did when the games were files on this site.
+  // If the file is gone (a teacher replaced the game after this page read the list), the list
+  // is read again once and the new version opened.
+  async function loadGame(key, run, retried = false) {
+    statusEl.textContent = LOADING_STATUS;
+    const src = pages[key].src;
+    try {
+      const res = await nativeFetch(src);
+      if (!res.ok && !retried) {
+        applyList(cleanList(await fetchListRows()));
+        if (run !== loadRun) return; // the game was deleted, and the default page is shown
+        if (hasOwn(pages, key) && pages[key].src !== src) {
+          loadGame(key, run, true);
+          return;
+        }
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.blob();
+      if (run !== loadRun) return;
+      gameUrl = URL.createObjectURL(new Blob([data], { type: GAME_TYPE }));
+      // Swap in another fresh iframe that starts on the game, instead of setting src on the
+      // empty one: a later src change could add a history entry, and under file:// Chrome and
+      // Edge load a blob: URL only as an iframe's first page.
+      const ready = frame.cloneNode(false);
+      ready.src = gameUrl;
+      frame.replaceWith(ready);
+      frame = ready;
+      statusEl.textContent = "";
+    } catch (err) {
+      if (run !== loadRun) return;
+      statusEl.textContent = `无法加载游戏 / Couldn't load the game (${err.message})`;
+    }
+  }
+
   function showPage(key) {
     const isContents = key === CONTENTS_KEY;
+    const page = isContents ? null : pages[key];
 
     // Swap in a fresh iframe instead of changing src, so sub-page loads don't add
     // their own history entries. The URL hash stays the only navigation history.
     // On the contents page the iframe is emptied, so a game's sound stops.
     const fresh = frame.cloneNode(false);
-    if (isContents) {
-      fresh.removeAttribute("src");
-    } else {
-      fresh.src = pages[key].src;
-    }
+    fresh.removeAttribute("src");
+    if (page && !page.remote) fresh.src = page.src;
     fresh.hidden = isContents;
     frame.replaceWith(fresh);
     frame = fresh;
     contentsView.hidden = !isContents;
 
+    // The old game is gone with its iframe, so its blob: URL can go too.
+    loadRun += 1;
+    revokeGameUrl();
+    statusEl.textContent = "";
+    if (page && page.remote) loadGame(key, loadRun);
+
     currentKey = key;
     markActive();
     showMeta(key);
-    if (publishing.size === 0) statusEl.textContent = "";
   }
 
   function route() {
@@ -350,7 +429,7 @@
     box.textContent = [...row.title][0] || "";
   }
 
-  // The picture, or the tile when there is none (or it can't be loaded yet, e.g. while publishing).
+  // The picture, or the tile when there is none (or it can't be loaded).
   function thumbBox(row) {
     const box = document.createElement("span");
     box.className = "card-thumb";
@@ -360,9 +439,8 @@
       return box;
     }
     const img = document.createElement("img");
-    // `updated` changes with every commit, so a replaced picture isn't served from the cache.
-    const version = window.location.protocol === "file:" ? "" : `?v=${encodeURIComponent(row.updated)}`;
-    img.src = `${UPLOAD_DIR}${row.key}.${row.thumb}${version}`;
+    // `updated` changes with every save, so a replaced picture isn't served from the cache.
+    img.src = `${FILE_BASE}${row.thumb}`;
     img.alt = "";
     img.loading = "lazy";
     img.decoding = "async";
@@ -373,7 +451,7 @@
 
   // Hovering a card shows the description, textbook · volume · lesson, author and file name.
   function cardTooltip(row) {
-    const fileName = (pages[row.key] ? pages[row.key].src : "").split("/").pop();
+    const fileName = row.file;
     const book = [row.textbook, row.volume, lessonLabel(row.lesson)].filter(Boolean).join(" · ");
     return [
       row.description,
@@ -385,19 +463,17 @@
       .join("\n");
   }
 
-  // A card: thumbnail + title, linking to its game. While publishing it isn't a link yet,
-  // because opening it now would show GitHub's 404 page.
+  // A card: thumbnail + title, linking to its game.
   function card(row) {
     const li = document.createElement("li");
-    const pending = publishing.has(row.key);
-    const box = document.createElement(pending ? "div" : "a");
-    box.className = pending ? "card card-pending" : "card";
-    if (!pending) box.href = `#${row.key}`;
+    const box = document.createElement("a");
+    box.className = "card";
+    box.href = `#${row.key}`;
     box.title = cardTooltip(row);
     const title = document.createElement("span");
     title.className = "card-title";
     title.lang = "zh-Hans";
-    title.textContent = pending ? `${row.title}${PUBLISHING_LABEL}` : row.title;
+    title.textContent = row.title;
     box.append(thumbBox(row), title);
     li.append(box);
     return li;
@@ -410,9 +486,7 @@
     contentsGrid.replaceChildren(...shown.map(card));
     contentsCount.textContent = `显示 ${shown.length} / ${rows.length} 个 · Showing ${shown.length} of ${rows.length}`;
     contentsEmpty.textContent =
-      rows.length === 0
-        ? "还没有上传的游戏 / No uploaded games yet."
-        : "没有符合筛选条件的游戏 / No games match the filters.";
+      rows.length === 0 ? EMPTY_TEXT[listState] : "没有符合筛选条件的游戏 / No games match the filters.";
     contentsEmpty.hidden = shown.length > 0;
     filtersClear.disabled = !anySet();
     renderActive();
@@ -430,7 +504,8 @@
     pages = { ...BUILTIN_PAGES };
     list.forEach((entry) => {
       pages[entry.key] = {
-        src: `${UPLOAD_DIR}${entry.key}.html`,
+        src: `${FILE_BASE}${entry.file}`,
+        remote: true,
         title: entry.title,
         description: entry.description,
         author: entry.author,
@@ -440,15 +515,9 @@
   }
 
   function applyList(list) {
+    listState = "ok";
     setUploaded(list);
 
-    if (pendingKey && hasOwn(pages, pendingKey)) {
-      const key = pendingKey;
-      pendingKey = null;
-      window.history.replaceState(null, "", `#${key}`);
-      showPage(key);
-      return;
-    }
     if (currentKey && currentKey !== CONTENTS_KEY && !hasOwn(pages, currentKey)) {
       // The open page was deleted.
       route();
@@ -460,23 +529,25 @@
     }
   }
 
-  // GitHub Pages caches js/uploaded-pages.js for up to ~10 min. Over http(s), load it once
-  // more with a unique query so newly published pages show up straight away.
-  function reloadListFresh() {
-    if (window.location.protocol === "file:") return;
-    const script = document.createElement("script");
-    script.src = `${LIST_SCRIPT}?t=${Date.now()}`;
-    script.addEventListener("load", () => {
-      script.remove();
-      // The manager's list (read from the GitHub API) is newer than anything on the site.
-      if (!gotManagerList) applyList(cleanList(window.MINGDE_UPLOADED_PAGES));
-      pendingKey = null;
-    });
-    script.addEventListener("error", () => {
-      script.remove();
-      pendingKey = null;
-    });
-    document.head.append(script);
+  // The rows of the Supabase table (public read, anon key only), never from a cache.
+  async function fetchListRows() {
+    const res = await nativeFetch(LIST_URL, { headers: { apikey: SUPABASE_KEY }, cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // Read the list of uploaded games at start-up.
+  async function loadList() {
+    if (!CONFIGURED) return;
+    try {
+      const rows = await fetchListRows();
+      // A list sent by the manager is at least as new as this one.
+      if (!gotManagerList) applyList(cleanList(rows));
+    } catch {
+      if (gotManagerList) return;
+      listState = "error";
+      renderRows();
+    }
   }
 
   // Under file:// the sender's origin is opaque ("null"; some browsers report "file://").
@@ -496,18 +567,13 @@
     statusEl.textContent = data.text;
   });
 
-  // Sent by js/manage.js after it changes the list:
-  // detail = { pages: [...], publishing: ["key", ...], status: "text" }
+  // Sent by js/manage.js after it reads or changes the list:
+  // detail = { pages: [...], status: "text" (optional) }
   document.addEventListener("pages-changed", (event) => {
     const detail = event.detail || {};
     gotManagerList = true;
-    publishing = new Set(Array.isArray(detail.publishing) ? detail.publishing : []);
     applyList(cleanList(detail.pages));
-    if (typeof detail.status === "string") {
-      statusEl.textContent = detail.status;
-    } else if (publishing.size > 0) {
-      statusEl.textContent = PUBLISHING_STATUS;
-    }
+    if (typeof detail.status === "string") statusEl.textContent = detail.status;
   });
 
   nav.addEventListener("click", (event) => {
@@ -557,11 +623,18 @@
   resetCriteria();
   filterField.value = "title";
   syncControls();
-  setUploaded(cleanList(window.MINGDE_UPLOADED_PAGES));
+  setUploaded([]);
+  // A link straight to an uploaded game (#<key>) waits for the list, instead of starting the
+  // default game first. Everything else is shown at once.
   const startKey = window.location.hash.slice(1);
-  if (startKey && !pageFromHash() && KEY_PATTERN.test(startKey)) {
-    pendingKey = startKey;
+  const waitForList = CONFIGURED && !pageFromHash() && KEY_PATTERN.test(startKey);
+  if (waitForList) {
+    statusEl.textContent = LOADING_STATUS;
+  } else {
+    route();
   }
-  route();
-  reloadListFresh();
+  loadList().then(() => {
+    // Unless the user already went somewhere else meanwhile.
+    if (waitForList && currentKey === null) route();
+  });
 })();

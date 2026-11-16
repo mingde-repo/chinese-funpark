@@ -4,8 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>明德中文乐园</title>
+  <!-- The Supabase project that stores the uploaded games (Supabase → Project Settings → API).
+       The URL and the anon / publishable key are public by design. Never put the service_role /
+       secret key here. -->
+  <meta name="mingde-supabase-url" content="">
+  <meta name="mingde-supabase-anon-key" content="">
   <link rel="stylesheet" href="css/style.css">
-  <script src="js/uploaded-pages.js" defer></script>
   <script src="js/main.js" defer></script>
   <script src="js/manage.js" defer></script>
 </head>
@@ -69,32 +73,27 @@
       <button type="button" id="manage-close" class="btn btn-small" aria-label="关闭 / Close">✕</button>
     </div>
 
-    <section class="manage-section" aria-labelledby="token-heading">
-      <h3 id="token-heading">① GitHub <span lang="zh-Hans">令牌</span> / token</h3>
-      <p id="token-state" class="hint"></p>
-      <div class="field-row">
-        <input type="password" id="token-input" class="field" autocomplete="off" spellcheck="false"
-          placeholder="github_pat_…" aria-label="GitHub token">
-        <button type="button" id="token-use" class="btn btn-small"><span lang="zh-Hans">使用</span> / Use</button>
-        <button type="button" id="token-forget" class="btn btn-small"><span lang="zh-Hans">清除</span> / Forget</button>
+    <section class="manage-section" aria-labelledby="signin-heading">
+      <h3 id="signin-heading">① <span lang="zh-Hans">老师登录</span> / Teacher sign-in</h3>
+      <p id="signin-state" class="hint"></p>
+      <form id="signin-form" class="field-row" novalidate>
+        <input type="email" id="signin-email" class="field" autocomplete="username" spellcheck="false"
+          placeholder="邮箱 / Email" aria-label="邮箱 / Email">
+        <input type="password" id="signin-password" class="field" autocomplete="current-password"
+          placeholder="密码 / Password" aria-label="密码 / Password">
+        <button type="submit" class="btn btn-small"><span lang="zh-Hans">登录</span> / Sign in</button>
+      </form>
+      <div id="signin-out-row" class="field-row" hidden>
+        <button type="button" id="signin-out" class="btn btn-small"><span lang="zh-Hans">退出</span> / Sign out</button>
       </div>
       <label class="check">
-        <input type="checkbox" id="token-remember">
+        <input type="checkbox" id="signin-remember">
         <span><span lang="zh-Hans">在此设备上记住</span> / Remember on this device</span>
       </label>
-      <p class="hint warning">⚠ <span lang="zh-Hans">上传的页面与本站同源，可能读取这里的令牌。只上传可信的页面。</span>
-        Uploaded pages run on this site's origin and could read the token. Only upload pages you trust.</p>
-      <details class="help">
-        <summary><span lang="zh-Hans">如何创建令牌</span> / How to create a token</summary>
-        <ol>
-          <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank"
-            rel="noopener noreferrer">GitHub → Settings → Fine-grained tokens → Generate new token</a>.</li>
-          <li>Resource owner: <code>mingde-repo</code>. Expiration: 90 days. Repository access:
-            <strong>Only select repositories</strong> → <code>chinese-funpark</code>.</li>
-          <li>Permissions → Repository permissions → <strong>Contents: Read and write</strong>.</li>
-          <li>Generate, copy the token (<code>github_pat_…</code>), paste it above and press Use.</li>
-        </ol>
-      </details>
+      <p class="hint warning">⚠ <span lang="zh-Hans">上传的页面与本站同源，可能读取这里的登录信息。只上传可信的页面。</span>
+        Uploaded pages run on this site's origin and could read the sign-in. Only upload pages you trust.</p>
+      <p class="hint"><span lang="zh-Hans">账号由网站管理员在 Supabase 中创建</span>
+        / Accounts are created by the site admin in Supabase (Authentication → Users).</p>
     </section>
 
     <section class="manage-section" aria-labelledby="upload-heading">
@@ -176,7 +175,7 @@
           (leave empty to keep the current picture)</p>
         <div class="field-row">
           <button type="button" id="edit-thumb-from-game" class="btn btn-small"
-            title="用游戏里的图片生成缩略图（从网站读取游戏）/ Make thumbnails from the game's pictures (loads the game from the site)"><span lang="zh-Hans">从游戏生成</span> / From the game</button>
+            title="用游戏里的图片生成缩略图（从存储读取游戏）/ Make thumbnails from the game's pictures (loads the game from storage)"><span lang="zh-Hans">从游戏生成</span> / From the game</button>
         </div>
         <div id="edit-thumb-pick" class="thumb-pick" hidden>
           <p id="edit-thumb-pick-note" class="hint" role="status" aria-live="polite"></p>
